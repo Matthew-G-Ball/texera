@@ -1,6 +1,6 @@
 # AGENTS.md
 
-## Architecture Map
+## Architecture Map 
 
 Apache Texera: Scala/sbt backend services + the Amber workflow execution
 engine, an Angular UI, and the agent service. JVM modules wired in
