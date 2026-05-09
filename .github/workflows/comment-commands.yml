@@ -21,10 +21,10 @@
 # by commenting `/take` (and self-release with `/untake`); PR-driven
 # assignee sync is handled by `pr-assignment.yml`.
 #
-# On pull requests, the author or any committer (write/maintain/admin)
-# can request or cancel reviewer requests via `/request-review @user
-# [@user ...]` and `/unrequest-review @user [@user ...]`. We avoid the
-# `/review` namespace so it stays free for future use (e.g. self-review).
+# On pull requests, the author can request or cancel reviewer requests
+# via `/request-review @user [@user ...]` and `/unrequest-review @user
+# [@user ...]`. We avoid the `/review` namespace so it stays free for
+# future use (e.g. self-review).
 name: Comment commands
 on:
   issue_comment:
@@ -121,41 +121,25 @@ jobs:
             }
             const action = match[1];
 
-            // Authorize: PR author always, otherwise commenter must hold
-            // write/maintain/admin on the repo (i.e. a committer).
-            let allowed = commenter === author;
-            if (!allowed) {
-              try {
-                const { data: perm } =
-                  await github.rest.repos.getCollaboratorPermissionLevel({
-                    owner, repo, username: commenter,
-                  });
-                allowed = ['write', 'maintain', 'admin'].includes(
-                  perm.permission,
-                );
-              } catch (e) {
-                core.warning(
-                  `permission lookup for ${commenter} failed: ${e.message}`,
-                );
-              }
-            }
-            if (!allowed) {
+            if (commenter !== author) {
               core.info(
-                `${commenter} is neither author nor committer on ` +
-                  `#${pull_number}; skipping.`,
+                `${commenter} is not the author of #${pull_number}; skipping.`,
               );
               return;
             }
 
             // Parse @user and @org/team mentions; route teams to the
             // team_reviewers bucket. Strip self so the API doesn't
-            // reject the whole atomic call over one bad name.
+            // reject the whole atomic call over one bad name. Copilot
+            // is a bot reviewer that the REST API expects as the exact
+            // slug "Copilot", so normalize any casing of @copilot.
             const reviewers = [];
             const team_reviewers = [];
             for (const [, h] of match[2].matchAll(
               /@([\w-]+(?:\/[\w.-]+)?)/g,
             )) {
               if (h.includes('/')) team_reviewers.push(h.split('/')[1]);
+              else if (h.toLowerCase() === 'copilot') reviewers.push('Copilot');
               else if (h.toLowerCase() !== author.toLowerCase())
                 reviewers.push(h);
             }
