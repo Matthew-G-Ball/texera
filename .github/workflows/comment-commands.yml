@@ -129,36 +129,80 @@ jobs:
             }
 
             // Parse @user and @org/team mentions; route teams to the
-            // team_reviewers bucket. Strip self so the API doesn't
-            // reject the whole atomic call over one bad name. Copilot
-            // is a bot reviewer that the REST API expects as the exact
-            // slug "Copilot", so normalize any casing of @copilot.
+            // team_reviewers bucket and the Copilot bot to bot_node_ids.
+            // Strip self so the API doesn't reject the whole atomic call
+            // over one bad name. The REST `requestReviewers` endpoint
+            // only accepts users/teams (rejects bots with "not a
+            // collaborator"), so @copilot goes through the GraphQL
+            // `requestReviews` mutation, which has a `botIds` input.
+            // BOT_kgDOCnlnWA is the stable node id of the
+            // copilot-pull-request-reviewer GitHub App on github.com.
+            const COPILOT_BOT_NODE_ID = 'BOT_kgDOCnlnWA';
             const reviewers = [];
             const team_reviewers = [];
+            const bot_node_ids = [];
             for (const [, h] of match[2].matchAll(
               /@([\w-]+(?:\/[\w.-]+)?)/g,
             )) {
               if (h.includes('/')) team_reviewers.push(h.split('/')[1]);
-              else if (h.toLowerCase() === 'copilot') reviewers.push('Copilot');
+              else if (h.toLowerCase() === 'copilot')
+                bot_node_ids.push(COPILOT_BOT_NODE_ID);
               else if (h.toLowerCase() !== author.toLowerCase())
                 reviewers.push(h);
             }
-            if (!reviewers.length && !team_reviewers.length) {
+            if (
+              !reviewers.length &&
+              !team_reviewers.length &&
+              !bot_node_ids.length
+            ) {
               core.warning(`No valid @mentions in '${action}'; skipping.`);
               return;
             }
 
-            const params = { owner, repo, pull_number, reviewers, team_reviewers };
             try {
-              if (action === 'request-review') {
-                await github.rest.pulls.requestReviewers(params);
-              } else {
-                await github.rest.pulls.removeRequestedReviewers(params);
+              if (reviewers.length || team_reviewers.length) {
+                const params = {
+                  owner, repo, pull_number, reviewers, team_reviewers,
+                };
+                if (action === 'request-review') {
+                  await github.rest.pulls.requestReviewers(params);
+                } else {
+                  await github.rest.pulls.removeRequestedReviewers(params);
+                }
+              }
+              if (bot_node_ids.length) {
+                if (action === 'request-review') {
+                  const { repository: { pullRequest } } = await github.graphql(
+                    `query($owner:String!,$repo:String!,$num:Int!){
+                      repository(owner:$owner,name:$repo){
+                        pullRequest(number:$num){id}
+                      }
+                    }`,
+                    { owner, repo, num: pull_number },
+                  );
+                  await github.graphql(
+                    `mutation($prId:ID!,$botIds:[ID!]!){
+                      requestReviews(input:{
+                        pullRequestId:$prId,botIds:$botIds,union:true
+                      }){clientMutationId}
+                    }`,
+                    { prId: pullRequest.id, botIds: bot_node_ids },
+                  );
+                } else {
+                  // GraphQL has no remove-bot-reviewer mutation; replacing
+                  // the set with `union: false` would clobber other
+                  // reviewers. Skip with a warning until we need it.
+                  core.warning(
+                    `unrequest-review @copilot is not supported; ` +
+                      `dismiss the request from the PR sidebar instead.`,
+                  );
+                }
               }
               core.info(
                 `${action} on #${pull_number} by ${commenter}: ` +
                   `users=[${reviewers.join(', ')}] ` +
-                  `teams=[${team_reviewers.join(', ')}]`,
+                  `teams=[${team_reviewers.join(', ')}] ` +
+                  `bots=[${bot_node_ids.join(', ')}]`,
               );
             } catch (e) {
               core.warning(
