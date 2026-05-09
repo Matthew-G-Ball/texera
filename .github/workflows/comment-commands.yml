@@ -108,9 +108,34 @@ jobs:
           script: |
             const body = (context.payload.comment.body || '').trim();
             const pull_number = context.payload.issue.number;
+            const comment_id = context.payload.comment.id;
             const commenter = context.payload.comment.user.login;
             const author = context.payload.issue.user.login;
             const { owner, repo } = context.repo;
+
+            // Helpers: react on the trigger comment so the user gets
+            // visible feedback even when the diagnostic comment race
+            // loses to a fast UI refresh, and post a sibling comment
+            // with details when something the user cares about fails.
+            const react = async (content) => {
+              try {
+                await github.rest.reactions.createForIssueComment({
+                  owner, repo, comment_id, content,
+                });
+              } catch (e) {
+                core.info(`reaction ${content} failed: ${e.message}`);
+              }
+            };
+            const postDiag = async (lines) => {
+              const body = lines.join('\n');
+              try {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: pull_number, body,
+                });
+              } catch (e) {
+                core.warning(`failed to post diagnostic comment: ${e.message}`);
+              }
+            };
 
             const match = body.match(
               /^\/(request-review|unrequest-review)\b(.*)$/s,
@@ -121,10 +146,19 @@ jobs:
             }
             const action = match[1];
 
+            await react('eyes');
+
             if (commenter !== author) {
               core.info(
                 `${commenter} is not the author of #${pull_number}; skipping.`,
               );
+              await react('-1');
+              await postDiag([
+                `:no_entry: \`/${action}\` is restricted to the PR author.`,
+                ``,
+                `Author of this PR is **@${author}**; the command came ` +
+                  `from **@${commenter}**.`,
+              ]);
               return;
             }
 
@@ -138,17 +172,20 @@ jobs:
             // BOT_kgDOCnlnWA is the stable node id of the
             // copilot-pull-request-reviewer GitHub App on github.com.
             const COPILOT_BOT_NODE_ID = 'BOT_kgDOCnlnWA';
+            const COPILOT_BOT_LOGIN = 'copilot-pull-request-reviewer';
             const reviewers = [];
             const team_reviewers = [];
             const bot_node_ids = [];
+            const skipped_self = [];
             for (const [, h] of match[2].matchAll(
               /@([\w-]+(?:\/[\w.-]+)?)/g,
             )) {
               if (h.includes('/')) team_reviewers.push(h.split('/')[1]);
               else if (h.toLowerCase() === 'copilot')
                 bot_node_ids.push(COPILOT_BOT_NODE_ID);
-              else if (h.toLowerCase() !== author.toLowerCase())
-                reviewers.push(h);
+              else if (h.toLowerCase() === author.toLowerCase())
+                skipped_self.push(h);
+              else reviewers.push(h);
             }
             if (
               !reviewers.length &&
@@ -156,22 +193,86 @@ jobs:
               !bot_node_ids.length
             ) {
               core.warning(`No valid @mentions in '${action}'; skipping.`);
+              await react('confused');
+              const lines = [
+                `:warning: \`/${action}\` did not find any reviewers to act on.`,
+                ``,
+                `Mention reviewers as \`@user\`, \`@org/team\`, or ` +
+                  `\`@copilot\`. The PR author cannot be requested as a ` +
+                  `reviewer of their own PR.`,
+              ];
+              if (skipped_self.length) {
+                lines.push(
+                  ``,
+                  `Skipped (self): ${skipped_self.map(h => '`@' + h + '`').join(', ')}.`,
+                );
+              }
+              await postDiag(lines);
               return;
             }
 
-            try {
-              if (reviewers.length || team_reviewers.length) {
-                const params = {
-                  owner, repo, pull_number, reviewers, team_reviewers,
-                };
+            // Track per-target outcomes so we can post a single
+            // consolidated diagnostic when something fails. Errors from
+            // any one path do not abort the others — partial success is
+            // useful (e.g. human reviewers added even if Copilot fails).
+            const failures = [];
+            const successes = [];
+
+            if (reviewers.length || team_reviewers.length) {
+              const params = {
+                owner, repo, pull_number, reviewers, team_reviewers,
+              };
+              try {
                 if (action === 'request-review') {
                   await github.rest.pulls.requestReviewers(params);
                 } else {
                   await github.rest.pulls.removeRequestedReviewers(params);
                 }
+                if (reviewers.length)
+                  successes.push(`users: ${reviewers.map(r => '`@' + r + '`').join(', ')}`);
+                if (team_reviewers.length)
+                  successes.push(`teams: ${team_reviewers.map(t => '`@' + owner + '/' + t + '`').join(', ')}`);
+              } catch (e) {
+                core.warning(`REST ${action} failed: ${e.message}`);
+                failures.push({
+                  target: 'users/teams',
+                  detail:
+                    `REST \`${action === 'request-review' ? 'requestReviewers' : 'removeRequestedReviewers'}\`` +
+                    ` for users=[${reviewers.join(', ')}] teams=[${team_reviewers.join(', ')}] ` +
+                    `returned: \`${e.message}\``,
+                  hint:
+                    `Common causes: the user is not a collaborator on this ` +
+                    `repo, the team slug is wrong, or you are trying to ` +
+                    `request the PR author. Check the spelling and ` +
+                    `permissions, then re-run \`/${action}\`.`,
+                });
               }
-              if (bot_node_ids.length) {
-                if (action === 'request-review') {
+            }
+
+            if (bot_node_ids.length) {
+              if (action === 'unrequest-review') {
+                // GraphQL has no remove-bot-reviewer mutation; replacing
+                // the set with `union: false` would clobber other
+                // reviewers. Surface this clearly instead of failing
+                // silently.
+                failures.push({
+                  target: 'copilot',
+                  detail:
+                    `\`/unrequest-review @copilot\` is not supported by ` +
+                    `the GitHub API.`,
+                  hint:
+                    `Dismiss the Copilot review request from the PR ` +
+                    `sidebar (Reviewers → click the × next to Copilot) ` +
+                    `instead.`,
+                });
+              } else {
+                try {
+                  // Resolve PR node id once, then run the mutation and
+                  // ask GitHub to echo the resulting reviewer set so we
+                  // can verify Copilot was actually attached. The
+                  // mutation reports success even when the org/repo
+                  // doesn't have Copilot code review enabled, so we
+                  // can't trust HTTP 200 alone.
                   const { repository: { pullRequest } } = await github.graphql(
                     `query($owner:String!,$repo:String!,$num:Int!){
                       repository(owner:$owner,name:$repo){
@@ -180,32 +281,104 @@ jobs:
                     }`,
                     { owner, repo, num: pull_number },
                   );
-                  await github.graphql(
+                  const result = await github.graphql(
                     `mutation($prId:ID!,$botIds:[ID!]!){
                       requestReviews(input:{
                         pullRequestId:$prId,botIds:$botIds,union:true
-                      }){clientMutationId}
+                      }){
+                        clientMutationId
+                        pullRequest{
+                          reviewRequests(first:50){
+                            nodes{
+                              requestedReviewer{
+                                __typename
+                                ... on User{login}
+                                ... on Bot{login}
+                                ... on Team{slug}
+                                ... on Mannequin{login}
+                              }
+                            }
+                          }
+                        }
+                      }
                     }`,
                     { prId: pullRequest.id, botIds: bot_node_ids },
                   );
-                } else {
-                  // GraphQL has no remove-bot-reviewer mutation; replacing
-                  // the set with `union: false` would clobber other
-                  // reviewers. Skip with a warning until we need it.
-                  core.warning(
-                    `unrequest-review @copilot is not supported; ` +
-                      `dismiss the request from the PR sidebar instead.`,
+                  const requestedLogins = (
+                    result.requestReviews.pullRequest.reviewRequests.nodes
+                      .map(n => n.requestedReviewer)
+                      .filter(r => r && r.__typename === 'Bot')
+                      .map(r => r.login.toLowerCase())
                   );
+                  if (requestedLogins.includes(COPILOT_BOT_LOGIN)) {
+                    successes.push('bot: `@copilot`');
+                  } else {
+                    failures.push({
+                      target: 'copilot',
+                      detail:
+                        `The GraphQL \`requestReviews\` mutation returned ` +
+                        `success, but \`${COPILOT_BOT_LOGIN}\` is not in ` +
+                        `the PR's review requests after the call ` +
+                        `(currently: ` +
+                        `[${requestedLogins.join(', ') || 'none'}]).`,
+                      hint:
+                        `This usually means **Copilot code review is not ` +
+                        `enabled for this repository or account**. To enable:\n\n` +
+                        `1. Confirm the account/org has a plan that ` +
+                        `includes Copilot code review (Copilot Pro, ` +
+                        `Pro+, Business, or Enterprise — the free tier ` +
+                        `does not include it).\n` +
+                        `2. Open **Settings → Code & automation → ` +
+                        `Copilot** (repo) or **Copilot → Policies** ` +
+                        `(org) and turn on *Copilot code review*.\n` +
+                        `3. Optionally enable *automatic review* there ` +
+                        `so new PRs get reviewed without \`/request-review\`.\n` +
+                        `4. Re-run \`/request-review @copilot\` once ` +
+                        `enabled.\n\n` +
+                        `Docs: https://docs.github.com/copilot/using-github-copilot/code-review/using-copilot-code-review`,
+                    });
+                  }
+                } catch (e) {
+                  core.warning(`GraphQL requestReviews failed: ${e.message}`);
+                  failures.push({
+                    target: 'copilot',
+                    detail:
+                      `GraphQL \`requestReviews\` threw: \`${e.message}\``,
+                    hint:
+                      `If the message mentions "Resource not accessible" ` +
+                      `or "not found", the workflow's \`GITHUB_TOKEN\` ` +
+                      `may lack \`pull-requests: write\`, or Copilot ` +
+                      `code review isn't available for this account. ` +
+                      `See: https://docs.github.com/copilot/using-github-copilot/code-review/using-copilot-code-review`,
+                  });
                 }
               }
-              core.info(
-                `${action} on #${pull_number} by ${commenter}: ` +
-                  `users=[${reviewers.join(', ')}] ` +
-                  `teams=[${team_reviewers.join(', ')}] ` +
-                  `bots=[${bot_node_ids.join(', ')}]`,
-              );
-            } catch (e) {
-              core.warning(
-                `${action} on #${pull_number} failed: ${e.message}`,
-              );
             }
+
+            core.info(
+              `${action} on #${pull_number} by ${commenter}: ` +
+                `users=[${reviewers.join(', ')}] ` +
+                `teams=[${team_reviewers.join(', ')}] ` +
+                `bots=[${bot_node_ids.join(', ')}] ` +
+                `successes=${successes.length} failures=${failures.length}`,
+            );
+
+            if (!failures.length) {
+              await react('rocket');
+              return;
+            }
+
+            await react(successes.length ? 'confused' : '-1');
+            const lines = [
+              successes.length
+                ? `:warning: \`/${action}\` partially succeeded.`
+                : `:x: \`/${action}\` failed.`,
+              ``,
+            ];
+            if (successes.length) {
+              lines.push(`**Succeeded:** ${successes.join('; ')}.`, ``);
+            }
+            for (const f of failures) {
+              lines.push(`**${f.target}** — ${f.detail}`, ``, f.hint, ``);
+            }
+            await postDiag(lines);
