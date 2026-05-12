@@ -1,4 +1,4 @@
-<h1 align="center">Apache Texera - Human-AI Collaborative Data Science Using Visual Workflows</h1>
+<h1 align="center">Apache Texera - Human-AI Collaborative Data Science Using Visual Workflows</h1> 
 
 <p align="center">
   <a href="https://texera.io"> <img src="frontend/src/assets/logos/full_logo_small.png" alt="texera-logo" height="150px"/> </a>
